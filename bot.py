@@ -57,94 +57,68 @@ def ensure_dataset_exists():
             raise
 
 # ==================== STREAMING UPLOAD ====================
-class UploadProgressCallback:
-    """Callback class for tracking upload progress"""
-    def __init__(self, user_id, file_name, file_size, status_msg, client):
-        self.user_id = user_id
-        self.file_name = file_name
-        self.file_size = file_size
-        self.status_msg = status_msg
-        self.client = client
-        self.uploaded = 0
-        self.last_update = 0
-        self.start_time = time.time()
-        
-    async def update(self, chunk_size):
-        """Update progress"""
-        self.uploaded += chunk_size
-        current_time = time.time()
-        
-        # Update message every 2 seconds to avoid flood
-        if current_time - self.last_update >= 2:
-            percentage = (self.uploaded / self.file_size) * 100
-            elapsed = current_time - self.start_time
-            speed = self.uploaded / elapsed if elapsed > 0 else 0
-            
-            # Format speed
-            if speed < 1024:
-                speed_str = f"{speed:.1f} B/s"
-            elif speed < 1024 * 1024:
-                speed_str = f"{speed/1024:.1f} KB/s"
-            else:
-                speed_str = f"{speed/(1024*1024):.1f} MB/s"
-            
-            progress_bar = self._get_progress_bar(percentage)
-            
-            message = (
-                f"📤 **Uploading to Hugging Face...**\n\n"
-                f"📁 File: `{self.file_name}`\n"
-                f"📊 Progress: {percentage:.1f}%\n"
-                f"{progress_bar}\n"
-                f"🚀 Speed: {speed_str}\n"
-                f"📦 Uploaded: {self._format_size(self.uploaded)} / {self._format_size(self.file_size)}"
-            )
-            
-            try:
-                await self.status_msg.edit(message)
-                self.last_update = current_time
-            except Exception as e:
-                logger.debug(f"Could not update progress message: {e}")
-    
-    def _get_progress_bar(self, percentage):
-        """Generate progress bar"""
-        filled = int(percentage / 10)
-        empty = 10 - filled
-        return f"[{'█' * filled}{'░' * empty}]"
-    
-    def _format_size(self, bytes_size):
-        """Format bytes to human readable"""
-        if bytes_size < 1024:
-            return f"{bytes_size} B"
-        elif bytes_size < 1024 * 1024:
-            return f"{bytes_size/1024:.1f} KB"
-        elif bytes_size < 1024 * 1024 * 1024:
-            return f"{bytes_size/(1024*1024):.1f} MB"
-        else:
-            return f"{bytes_size/(1024*1024*1024):.1f} GB"
-
 async def upload_file_with_progress(file_path, file_name, user_id, status_msg):
     """Upload file to HF Dataset with progress tracking"""
     file_size = os.path.getsize(file_path)
-    progress = UploadProgressCallback(user_id, file_name, file_size, status_msg, client)
     
-    # Upload with streaming
-    def upload_with_callback():
-        """Upload function that runs in thread"""
-        with open(file_path, 'rb') as f:
-            # Read and upload in chunks
-            chunk_size = 1024 * 1024  # 1MB chunks
-            uploaded_data = bytearray()
+    # Progress tracking
+    uploaded_bytes = [0]  # Use list to modify in nested function
+    last_update = [time.time()]
+    start_time = time.time()
+    
+    # Create a custom tqdm-like callback
+    class ProgressTracker:
+        def __init__(self):
+            self.n = 0
             
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                uploaded_data.extend(chunk)
-                
-                # Schedule async update
-                asyncio.create_task(progress.update(len(chunk)))
+        def update(self, n):
+            self.n += n
+            # Schedule async update
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                update_message(self.n),
+                loop
+            )
+    
+    async def update_message(current_bytes):
+        """Update Telegram message with progress"""
+        uploaded_bytes[0] = current_bytes
+        current_time = time.time()
+        
+        # Update every 2 seconds
+        if current_time - last_update[0] >= 2:
+            percentage = (current_bytes / file_size) * 100 if file_size > 0 else 0
+            elapsed = current_time - start_time
+            speed = current_bytes / elapsed if elapsed > 0 else 0
             
-            # Upload complete file
+            speed_str = _format_speed(speed)
+            filled = int(percentage / 10)
+            empty = 10 - filled
+            progress_bar = f"[{'█' * filled}{'░' * empty}]"
+            
+            message = (
+                f"📤 **Uploading to Hugging Face...**\n\n"
+                f"📁 File: `{file_name}`\n"
+                f"📊 Progress: {percentage:.1f}%\n"
+                f"{progress_bar}\n"
+                f"🚀 Speed: {speed_str}\n"
+                f"📦 Uploaded: {_format_size(current_bytes)} / {_format_size(file_size)}"
+            )
+            
+            try:
+                await status_msg.edit(message)
+                last_update[0] = current_time
+            except Exception as e:
+                logger.debug(f"Could not update progress: {e}")
+    
+    # Upload in executor
+    loop = asyncio.get_event_loop()
+    
+    def do_upload():
+        """Perform the upload"""
+        try:
+            # For now, simple upload without real-time progress
+            # HF API doesn't expose easy progress callbacks
             hf_api.upload_file(
                 path_or_fileobj=file_path,
                 path_in_repo=file_name,
@@ -152,13 +126,34 @@ async def upload_file_with_progress(file_path, file_name, user_id, status_msg):
                 repo_type="dataset",
                 commit_message=f"Upload {file_name} via Telegram bot"
             )
+            return True
+        except Exception as e:
+            logger.error(f"HF upload error: {e}")
+            raise
     
-    # Run upload in thread pool to not block
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, upload_with_callback)
+    # Show uploading message
+    await update_message(0)
     
-    # Final update to 100%
-    await progress.update(0)
+    # Simulate progress updates while uploading
+    async def show_progress():
+        """Show simulated progress during upload"""
+        for i in range(1, 10):
+            await asyncio.sleep(3)
+            simulated_progress = (file_size * i) // 10
+            await update_message(simulated_progress)
+    
+    # Run upload and progress updates concurrently
+    try:
+        progress_task = asyncio.create_task(show_progress())
+        await loop.run_in_executor(None, do_upload)
+        progress_task.cancel()
+        
+        # Final 100% update
+        await update_message(file_size)
+        
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        raise
 
 # ==================== HTTP HEALTH CHECK SERVER ====================
 async def health_check(request):
